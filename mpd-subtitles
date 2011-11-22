@@ -1,0 +1,352 @@
+#!/usr/bin/env python2
+# -*- coding: UTF-8 -*-
+### MPD Subtitles ###############
+# Version 0.4a by Scott Garrett #
+# Wintervenom [(at)] gmail.com  #
+#################################
+# Dependencies:
+#
+# python-mpd (MPD client library)
+#   http://jatreuman.indefero.net/p/python-mpd
+#
+# pyosd (Python XOSD bindings)
+#   http://repose.cx/pyosd/
+#
+# python-xlib
+#   http://python-xlib.sourceforge.net
+#
+# iomisc (Misc IO functions)
+#   http://wintervenom.brandonw.net/Projects/py-modules/iomisc.py
+#
+# lrcutils (LRC lyric file parsing)
+#   http://wintervenom.brandonw.net/Projects/py-modules/lrcutils.py
+#
+# mpdmisc (Misc MPD functions)
+#   http://wintervenom.brandonw.net/Projects/py-modules/mpdmisc.py
+#
+# osdsubs (XOSD subtitles)
+#   http://wintervenom.brandonw.net/Projects/py-modules/osdsubs.py
+#
+#################################
+# Changelog:
+#
+# 0.1a
+#   Initial version.
+#
+# 0.2a
+#   Cleaned up code, and various bug-fixes.
+#   Allow the use of ANSI colors with the [c:X] attribute stamp.
+#   Don't poll MPD so much while waiting for new lines to display when idle.
+#   Utilize MPD's idle feature instead of interval-polling for song-changes.
+#   Handle SIGTERM and -INT gracefully.
+#
+# 0.3a
+#   Download and cache lyrics from web servers with mpd-lrcserver script.
+#   Allow disabling of fallback servers.
+#
+# 0.4a
+#   Option to vertical-invert subtitle positions.
+#   Options to set colors.
+#   Fixed mistakes in getopts long arguments.
+#
+#################################
+# To-Do:
+#
+# - Option to display lyrics in terminal instead of OSD.
+#
+#################################
+#
+# This program is free software. It comes without any warranty, to
+# the extent permitted by applicable law. You can redistribute it
+# and/or modify it under the terms of the Do What The Fuck You Want
+# To Public License, Version 2, as published by Sam Hocevar. See
+# http://sam.zoy.org/wtfpl/COPYING for more details.
+
+
+from __future__ import with_statement, print_function
+import codecs
+import getopt
+import iomisc
+import lrcutils
+import mpd
+import mpdmisc
+import os
+import osdsubs
+import select
+import signal
+import sys
+import time
+import urllib
+import urllib2
+
+
+
+VERSION = '0.3a'
+DEFAULT_SERVERS=[
+    'wintervenom.mycrosoft.us',
+    'wintervenom.brandonw.net/Misc'
+]
+
+
+
+def usage():
+    """ Print usage message and exit. """
+    print("""MPD Subtitles
+Version %s by Scott Garrett
+Wintervenom [(at)] gmail.com
+
+Usage: mpd-subtitles [OPTS]
+    -h  --help       Obvious. ;)
+    -d  --nodefaults Don't fall back to default servers.
+    -i  --invert     Swap vertical placement of subtitles.
+        --color#=    Change definition of color where # is 0-7.
+        --colord=    Change default text color to definition #0-7.
+        --host=      Address of MPD server.
+        --port=      Listening port of MPD server.
+        --pass=      Password of MPD server.
+""" % VERSION)
+    sys.exit(0)
+
+
+
+class ExitFlag(Exception):
+    pass
+
+
+
+def query(address, post=None, size=100000):
+    """ Lazy wraper to send queries to mpd-lrcservers. """
+    address = 'http://' + address + '/mpd-lrcserver.php'
+    try:
+        if post:
+            post = urllib.urlencode(post)
+            request = urllib2.Request(address, post)
+            response = urllib2.urlopen(request)
+        else:
+            response = urllib2.urlopen(address)
+    except (urllib2.URLError, urllib2.HTTPError), error:
+        print(str(error))
+        return None
+    return response.read(size)
+
+
+
+def getlyrics(artist, title, time=0, servers=[]):
+    """ Retrieve the LRC lyrics to a song.
+    NothingFound raised if none available.
+    ReadError raised if can't determine encoding. """
+    home = os.path.expanduser('~')
+    artistdir = iomisc.sanitize(artist).lower()
+    lyricsfile = iomisc.sanitize('%s-%d.lrc' % (title, time)).lower()
+    lyricspath = os.path.join(home, '.cache', 'mpd-subtitles')
+
+    if not os.path.exists(lyricspath):
+        os.makedirs(lyricspath)
+    # Is the lyrics file already on the disk?
+    try:
+        lyricspath = iomisc.fuzzypath([lyricspath, artistdir, lyricsfile])
+        if lyricspath.endswith('.lrc'):
+            rawlrc = iomisc.read(lyricspath)
+        else:
+            raise iomisc.NothingFound('No LRC lyrics found')
+    except (iomisc.NothingFound):
+        # Try to download lyrics instead.
+        success = False
+        for server in servers:
+            # Query server version.
+            print('Querying "%s"...' % server)
+            version = query(server, size=20)
+            if version == None:
+                print('Server error or unavailable')
+                continue
+            elif not version.startswith('mpd-lrcserver-0.'):
+                for char in ("\t", "\n", "\r"):
+                    version = version.replace(char, ' ')
+                print('Incompatible mpd-lrcserver version: %s' % version)
+                continue
+            # Request LRC file.
+            post = {'a': urllib.quote(artist),
+                    't': urllib.quote(title),
+                    'd': time}
+            rawlrc = query(server, post)
+            if rawlrc in (None, 'NoMatch', 'ReadError'):
+                print('None availible (response: %s)' % rawlrc)
+            elif len(rawlrc.strip()) > 10:
+                print('Downloaded successfully')
+                success = True
+                break
+        if success:
+            rawlrc = rawlrc.decode('utf8', 'ignore')
+        else:
+            raise iomisc.NothingFound('No LRC lyrics found')
+        # Cache lyrics to disk.
+        lyricspath = os.path.join(lyricspath, artistdir)
+        if not os.path.exists(lyricspath):
+            os.makedirs(lyricspath)
+        lyricspath = os.path.join(lyricspath, lyricsfile)
+        with codecs.open(os.path.join(lyricspath), 'w', 'utf-8') as f:
+            f.write(rawlrc)
+    return lrcutils.parselrc(rawlrc)
+
+
+
+def exit(signal, frame):
+        print('\n*** Exit signal %s received ***' % signal)
+        raise ExitFlag('Exit signal %s received' % signal)
+
+
+
+def main():
+    """ The living room. """
+    # MPD server host and port.
+    host = ['localhost', 6600]
+    # MPD password.
+    password = None
+    # MPD client object.
+    client = mpd.MPDClient()
+    # OSD subtitle helper object.
+    osd = osdsubs.OSD()
+    # Handle SIGINT and SIGTERM.
+    signal.signal(signal.SIGINT, exit)
+    signal.signal(signal.SIGTERM, exit)
+    # Fall back to default servers by default.
+    opt_nodefaults = False
+    # Vertical inversion of subtitles disables by default.
+    opt_invert = False
+    # Subtitle color definitions.
+    colors = ['gray', 'red', 'green', 'yellow', 'blue', 'magenta',
+              'cyan', 'white']
+    defaultcolor = 3
+
+    # Deal with any flags that were passed at run-time.
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'hdi',
+                                   ['help', 'nodefaults', 'invert', 'color0=',
+                                    'color1=', 'color2=', 'color3=', 'color4=',
+                                    'color5=', 'color6=', 'color7=', 'colord=',
+                                    'host=', 'port=', 'pass='])
+    except getopt.GetoptError, error:
+        print(str(error))
+        sys.exit(1)
+    for o, a in opts:
+        if o in ('-h', '--help'):
+            usage()
+        if o in ('-d', '--nodefaults'):
+            opt_nodefaults = True
+        if o in ('-i', '--invert'):
+            opt_invert = True
+        if o.startswith('--color'):
+            try:
+                colors[int(o[7])] = a
+            except (IndexError, ValueError):
+                if o[7] == 'd':
+                    try:
+                        defaultcolor = max(0, min(7, int(a)))
+                    except ValueError:
+                        print('Invalid default color.  Default used.')
+                        defaultcolor = 3
+                else:
+                    print('option '+o+' not recognized')
+                    sys.exit(0)
+        if o == '--host':
+            host[0] = a
+        if o == '--port':
+            host[1] = int(a)
+        if o == '--pass':
+            password = a
+
+    osd.colors = colors
+    osd.defaultcolor = defaultcolor
+    osd.invert = opt_invert
+
+    print('Using servers (in order of priority):')
+    servers = []
+    for server in args:
+        servers.append(server.replace('http://', ''))
+        print('  ' + server)
+    if not opt_nodefaults:
+        for server in DEFAULT_SERVERS:
+            servers.append(server)
+            print('  ' + server)
+
+    # Let's get down to business!
+    while True:
+        # Make sure we're connected to the MPD server.
+        if not mpdmisc.mpdreconnect(client, host, password):
+            break
+        try:
+            # Grab information about the current song (if any) and search
+            # for lyrics.
+            song = client.currentsong()
+            songid = client.status()['songid']
+            artist = song.get('artist', '[Unknown]')
+            title = song.get('title', '[Unknown]')
+            duration = int(song['time'])
+            try:
+                print('Looking for LRC lyrics for:')
+                print('  Artist: %s' % artist)
+                print('   Title: %s' % title)
+                print('    Time: %d seconds' % duration)
+                metadata, lyrics = getlyrics(artist, title, duration, servers)
+            except (iomisc.NothingFound, iomisc.ReadError), error:
+                print(str(error))
+                # Wait until a song-change to try again.
+                while True:
+                    client.send_idle()
+                    select.select([client], [], [])
+                    if client.fetch_idle()[0] == 'player':
+                        if songid != client.status()['songid']:
+                            break
+            index = 1   # Start of lyrics.
+            idle = 0.05 # Initial idling time.
+            while songid == client.status()['songid']:
+                elapsed = float(client.status()['elapsed'])
+                # Backpedal to appropriate position if we're too far ahead.
+                # Subtract 0.2 seconds to make up for OSD init time.
+                while elapsed < lyrics[index - 1][0] - 0.2:
+                    index -= 1
+                while elapsed > lyrics[index][0] - 0.2:
+                    # If we're not playing Catch-Up, process the line.
+                    if elapsed < lyrics[index + 1][0]:
+                        osd.display(lyrics[index][1])
+                        # Wake up!
+                        idle = 0.05
+                    index += 1
+                else:
+                    # Take a little nap if we're still waiting until it's time
+                    # to display something.  Drift off to a deeper sleep the
+                    # longer it takes, up to half a second.
+                    time.sleep(idle)
+                    if idle < 0.5:
+                        idle += 0.01
+        except mpd.ConnectionError, error:
+            # Print what happenend, return to top of main loop, and try to
+            # reconnect.
+            print(str(error))
+        except KeyError:
+            print('MPD stopped.')
+            while True:
+                try:
+                    client.send_idle()
+                    select.select([client], [], [])
+                    if client.fetch_idle()[0] == 'player':
+                        client.status()['songid']
+                        break
+                except KeyError:
+                    # Still nothing playing; keep waiting.
+                    pass
+                except mpd.ConnectionError, error:
+                    # Return to top of main loop and try to reconnect.
+                    break
+        except ExitFlag:
+            try:
+                client.disconnect()
+            except:
+                pass
+            print('Exiting.')
+            break
+
+
+
+if __name__ == '__main__':
+    main()

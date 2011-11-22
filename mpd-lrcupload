@@ -1,0 +1,174 @@
+#!/usr/bin/env python2
+# -*- coding: UTF-8 -*-
+### MPD Subtitles LRC Upload #####
+# Version 0.3a by Scott Garrett  #
+# Wintervenom [(at)] gmail.com   #
+##################################
+# Dependencies:
+#
+# iomisc (Misc IO functions)
+#   http://wintervenom.brandonw.net/Projects/py-modules/iomisc.py
+#
+# lrcutils (LRC lyric file parsing)
+#   http://wintervenom.brandonw.net/Projects/py-modules/lrcutils.py
+#
+##################################
+# Changelog:
+#
+# 0.1a
+#   Initial version.
+#
+# 0.2a
+#   Fixed duration bug.
+#
+# 0.3a
+#   Option to append to default servers.
+#
+# 0.4a
+#   Fix Unicode decoding problems.
+#
+#################################
+#
+# This program is free software. It comes without any warranty, to
+# the extent permitted by applicable law. You can redistribute it
+# and/or modify it under the terms of the Do What The Fuck You Want
+# To Public License, Version 2, as published by Sam Hocevar. See
+# http://sam.zoy.org/wtfpl/COPYING for more details.
+
+
+from __future__ import with_statement, print_function
+import getopt
+import iomisc
+import lrcutils
+import os
+import sys
+import urllib
+import urllib2
+
+
+
+VERSION = '0.4a'
+DEFAULT_SERVERS=[
+    'wintervenom.mycrosoft.us',
+    'wintervenom.brandonw.net/Misc'
+]
+
+
+
+def usage():
+    """ Print usage message and exit. """
+    print("""MPD Subtitles LRC Upload
+Version %s by Scott Garrett
+Wintervenom [(at)] gmail.com
+
+Uploads LRC lyrics to server(s) with mpd-lrcserver.php.
+Usage: mpd-lrcupload [LRC-FILE] [SERVER] ([SERVER] ...)
+    -h --help   Obvious. ;)
+    -a --append Upload to both default and specified server(s).
+
+If no servers are given, will default to:
+""" % VERSION)
+    for server in DEFAULT_SERVERS:
+        print('  ' + server)
+    sys.exit(0)
+
+
+
+class ExitFlag(Exception):
+    pass
+
+
+
+def query(address, post=None, size=100000):
+    """ Lazy wraper to send queries to mpd-lrcservers. """
+    address = 'http://' + address + '/mpd-lrcserver.php'
+    try:
+        if post:
+            post = urllib.urlencode(post)
+            request = urllib2.Request(address, post)
+            response = urllib2.urlopen(request)
+        else:
+            response = urllib2.urlopen(address)
+    except (urllib2.URLError, urllib2.HTTPError), error:
+        print(str(error))
+        return None
+    return response.read(size)
+
+
+
+def main():
+    """ The situation room. """
+    opt_append = False
+    servers = DEFAULT_SERVERS
+    # Deal with any flags that were passed at run-time.
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'ha', ['help', 'append'])
+    except getopt.GetoptError, error:
+        print(str(error))
+        sys.exit(1)
+    for o, a in opts:
+        if o in ('-h', '--help'):
+            usage()
+        if o in ('-a', '--append'):
+            opt_append = True
+
+    l = len(args)
+    if l == 0:
+        usage()
+    else:
+        if not opt_append and l > 1:
+            servers = []
+        for server in args[1:]:
+            servers.append(server.replace('http://', ''))
+
+    if not os.path.exists(args[0]):
+        print('No such file.')
+        sys.exit(1)
+
+    # Read and parse LRC.
+    try:
+        rawlrc = iomisc.read(args[0]).encode('utf-8', 'ignore')
+        metadata, lyrics = lrcutils.parselrc(rawlrc)
+    except iomisc.ReadError, error:
+        print('Read error: %s' % error)
+        sys.exit(1)
+
+    # Grab metadata.
+    artist = metadata.get('ar', '')
+    title = metadata.get('ti', '')
+    album = metadata.get('al', '')
+    duration = metadata.get('du', '0')
+    # Make user correct screwed-up durations.
+    if not str(duration).isdigit():
+        print('Duration "%s" is not an integer.' % duration)
+        print('Please fix this, then try again.')
+        sys.exit(1)
+
+    for server in servers:
+        # Query server for version.
+        print('Querying "%s"...' % server)
+        version = query(server, size=20)
+        if version == None:
+            print('Server error or unavailible.')
+            continue
+        elif not version.startswith('mpd-lrcserver-0.'):
+            for char in ("\t", "\n", "\r"):
+                version = version.replace(char, ' ')
+            print('Incompatible mpd-lrcserver version: %s' % version)
+            continue
+        # Submit lyrics.
+        print('Uploading "%s"...' % args[0])
+        post = {'a': artist,
+                't': title,
+                'd': duration,
+                'l': rawlrc}
+        r = query(server, post)
+        if r not in ['Success']:
+            print('Upload rejected (response: %s)' % r)
+        else:
+            print('Uploaded successfully')
+
+
+
+if __name__ == '__main__':
+    main()

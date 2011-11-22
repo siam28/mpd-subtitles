@@ -1,0 +1,743 @@
+#!/usr/bin/env python2
+# -*- coding: UTF-8 -*-
+### MPD Subtitles LRC Editor ####
+# Version 0.4a by Scott Garrett #
+# Wintervenom [(at)] gmail.com  #
+#################################
+# Dependencies:
+#
+# python-mpd (MPD client library)
+#   http://jatreuman.indefero.net/p/python-mpd
+#
+# python-urwid (Console UI library)
+#   http://excess.org/urwid/
+#
+# iomisc (Misc IO functions)
+#   http://wintervenom.brandonw.net/Projects/py-modules/iomisc.py
+#
+# lrcutils (LRC lyric file parsing)
+#   http://wintervenom.brandonw.net/Projects/py-modules/lrcutils.py
+#
+# mpdmisc (Misc MPD functions)
+#   http://wintervenom.brandonw.net/Projects/py-modules/mpdmisc.py
+#
+#################################
+# Changelog:
+#
+# 0.1a
+#   Initial version.
+#
+# 0.2a
+#   New editor features:
+#   Line-transposing, FIFO yank/paste/cut, revert, insert-mode scroll,
+#   Sort lines.
+#   Option to disable packing timestamps.
+#
+# 0.3a
+#   Fixed left/right scrolling while in command mode.
+#   Added clear line.
+#   Added in-place write toggle.
+#
+# 0.4a
+#   Added album, contributor, and copyright tags.
+#   Edit functions keep metadata fields in place.
+#   Unicode no longer causes errors on save.
+#   Cutting no longer goes out of bounds.
+#
+#################################
+#
+# This program is free software. It comes without any warranty, to
+# the extent permitted by applicable law. You can redistribute it
+# and/or modify it under the terms of the Do What The Fuck You Want
+# To Public License, Version 2, as published by Sam Hocevar. See
+# http://sam.zoy.org/wtfpl/COPYING for more details.
+
+from __future__ import with_statement, print_function
+import codecs
+import getopt
+import iomisc
+import lrcutils
+import mpd
+import mpdmisc
+import os
+import re
+import sys
+import urwid
+
+
+
+VERSION = '0.4a'
+TAGS = ('ar', 'ti', 'al', 'cr', 'du', 'by')
+TAGNAMES = {
+    'ar': 'Artist',
+    'ti': 'Title',
+    'al': 'Album',
+    'cr': 'Copyright',
+    'du': 'Duration',
+    'by': 'Contributor'
+}
+TAGLEN = len(TAGS)
+
+
+
+
+def usage():
+    """ Print usage message and exit. """
+    print("""MPD Subtitles LRC Editor
+Version %s by Scott Garrett
+Wintervenom [(at)] gmail.com
+
+Usage: mpd-lrceditor [OPTS] [FILE]
+    -h --help       Obvious. ;)
+    -p --nopack     Don't pack timestamps when saving.
+    -i --inplace    Write output to input file instead of
+                    to MPD subtitle cache.
+       --host       Address of MPD server.
+       --port       Listening port of MPD server.
+       --pass       Password of MPD server.
+
+
+Keys:
+    I           Line-editing mode.
+    :-- Esc         Exit line-editing mode.
+    :-- PgUp        Increase time by 0.01 seconds.
+    :-- PgDn        Decrease time by 0.01 seconds.
+    :-- Alt-PgUp    Increase time by 1 second.
+    :-- Alt-PgDn    Decrease time by 1 second.
+    `-- Return      Synchronize timestamp and move down.
+    S           Synchronize timestamp.
+    Return      Synchronize timestamp and move down.
+    Shift-S     Synchronize song info from MPD.
+    O           Insert line after.
+    Shift-O     Insert line before.
+    T           Transpose line up.
+    Shift-T     Transpose line down.
+    K           Duplicate line down.
+    Shift-K     Duplicate line up.
+    Y           Yank line.
+    Shift-D     Cut line.
+    P           Paste line before.
+    Shift-P     Paste line after.
+    Shift-X     Clear line.
+    Shift-R     Sort by timestamp.
+    Shift-W     Write file to disk.
+    Alt-W       Toggle writing file in-place.
+    Shift-U     Revert all changes.
+    Shift-Q     Quit without saving. DOES NOT CONFIRM.
+
+
+Formatting:
+
+Normal lines will be placed at the bottom-center.
+    [01:12.03]# You cannot stop me, #
+    [01:24.67]# I just don't quit #
+
+Position tags can be used to place a line at a location.
+    [00:01.53][p:-1]Bottom-left.
+    [00:02.89][p:0]Bottom-center.
+    [00:03.33][p:1]Bottom-right.
+
+    [00:01.76][p:-1,-1]Top-left.
+    [00:02.12][p:0,-1]Top-center.
+    [00:03.52][p:1,-1]Top-right.
+
+    [00:01.24][p:-1,-1]Bottom-left.
+    [00:02.65][p:0,-1]Bottom-center.
+    [00:03.47][p:1,-1]Bottom-right.
+
+Color tags will set the line to a color.
+- 0 or w: white
+- 1 or r: red
+- 2 or g: green
+- 3 or y: yellow
+- 4 or b: blue
+- 5 or m: magenta
+- 6 or c: cyan
+- 7 or a: gray
+    [00:01.03][c:6][screaming]
+    [00:04.03][c:2]# I can't take it anymore! #
+
+Pipes can be used to split lines into voices.
+You can have up to five voices per line.
+    [00:36.02]# Crank it up! # | - Say what?
+    [00:40.34]# I said, "Let's crank it up!" # | - Okay!
+
+Position and color tags can prefix each voice.
+    [01:02.19][p:-1][c:g]Yes! | Really? | [p:1][c:m]No!
+
+Timeout tags set how long a line will be dispayed.
+Generally only useful with voices.
+    [01:02.19][t:1]- OK! | [t:2]- Yeah, whatever. | Blah, blah.
+""" % VERSION)
+    sys.exit(0)
+
+
+
+class ExitFlag(Exception):
+    pass
+
+
+
+class EditWindow(urwid.ListBox):
+    def keypress(self, size, key):
+        (maxcol, maxrow) = size
+        line, index = self.body.get_focus()
+        if not line: return key
+        if key in ('page up', 'page down'):
+            if line.selectable():
+                key = line.keypress((maxcol,), key)
+            if key is None:
+                self.make_cursor_visible((maxcol, maxrow))
+                return
+        return self.__super.keypress(size, key)
+
+
+
+class LineEdit(urwid.Edit):
+    """ Modal subtitle line-editor. """
+    insertmode = False
+
+
+    def isstamp(self):
+        """ Is this line a timestamp? """
+        return self.caption[0] == '['
+
+
+    def keypress(self, size, key):
+        if not self.insertmode:
+            # Enter line-editing mode.
+            if key in ('left', 'right'):
+                return self.__super.keypress(size, key)
+            elif key == 'i':
+                self.insertmode = True
+                setstatus('-- Editing line --', 'alert')
+            else:
+                return key
+        else:
+            # Exit line-editing mode.
+            if key == 'esc':
+                self.insertmode = False
+                setstatus('')
+            # Increase time by 0.01 seconds.
+            elif key == 'page up':
+                if not self.isstamp():
+                    return
+                # Don't go over 99h 59m 59s.
+                seconds = lrcutils.stamptosecs(self.caption) + 0.01
+                if seconds < 356578:
+                    self.set_caption(lrcutils.secstostamp(seconds))
+            # Decrease time by 0.01 seconds.
+            elif key == 'page down':
+                if not self.isstamp():
+                    return
+                seconds = lrcutils.stamptosecs(self.caption) - 0.01
+                if seconds > 0:
+                    self.set_caption(lrcutils.secstostamp(seconds))
+            # Increase time by 1 second.
+            elif key == 'meta page up':
+                if not self.isstamp():
+                    return
+                seconds = lrcutils.stamptosecs(self.caption) + 1
+                if seconds < 356578:
+                    self.set_caption(lrcutils.secstostamp(seconds))
+            # Decrease time by 1 second.
+            elif key == 'meta page down':
+                if not self.isstamp():
+                    return
+                seconds = lrcutils.stamptosecs(self.caption) - 1
+                if seconds > 0:
+                    self.set_caption(lrcutils.secstostamp(seconds))
+            elif key in ('up', 'down'):
+                self.insertmode = False
+                setstatus('')
+                return 'insert ' + key
+            else:
+                return self.__super.keypress(size, key)
+
+
+
+class LRCWalker(urwid.ListWalker):
+    """ Le handler of lines. """
+    def __init__(self, infile, mpdhost, mpdpass):
+        self.infile = infile
+        self.mpdhost = mpdhost
+        self.mpdpass = mpdpass
+        self.client = mpd.MPDClient()
+        self.cutbuffer = [None]
+        # The line currently selected.
+        self.focus = 0
+        # Start off with song metadata.
+        self.lyrics = []
+        for tag in TAGS:
+            if tag == 'du':
+                value = '0'
+            elif tag == 'by':
+                value = os.getlogin()
+            else:
+                value = ''
+            self.lyrics.append(self._newline(tag, value))
+        if os.path.exists(infile):
+            # Read the file.
+            lrc = iomisc.read(infile)
+            # Parse it.
+            metadata, lrc = lrcutils.parselrc(lrc, False, False)
+            # Make LineEdit objects for each line.
+            for time, line in lrc[1:-1]:
+                self.lyrics.append(self._newline(time, line))
+        else:
+                metadata = {}
+                self.lyrics.append(self._newline(0, ''))
+
+        # Set the metadata lines from what we've parsed.
+        for i, f in enumerate(TAGS):
+            try:
+                self.lyrics[i].original_widget.set_edit_text(metadata[f])
+            except KeyError:
+                pass
+        self._modified()
+
+
+    def _getline(self, index):
+        """ Return line at index and the index itself. """
+        if index < 0 or index >= len(self.lyrics):
+            return None, None
+        return self.lyrics[index], index
+
+
+    def _newline(self, time, line):
+        """ Create a LineEdit, wrap it in an AttrMap. """
+        if type(time) != str:
+            edit = LineEdit(lrcutils.secstostamp(time), line, allow_tab=True)
+        else:
+            caption = TAGNAMES.get(time, time)
+            edit = LineEdit('%11s: ' % caption, line)
+            edit.tag = time
+        edit.set_edit_pos(0)
+        edit = urwid.AttrMap(edit, None, 'current')
+        return edit
+
+
+    def _getelapsed(self):
+        """ Get the elapsed time from MPD. """
+        try:
+            setstatus('')
+            return float(mpdmisc.mpdreconnect(self.client, self.mpdhost,
+                                              self.mpdpass)['elapsed'])
+        except KeyError:
+            setstatus('MPD is stopped', 'alert')
+            return float(0)
+
+
+    def get_focus(self):
+        """ Return the current line. """
+        return self._getline(self.focus)
+
+
+    def set_focus(self, focus):
+        """ Jump to a different line number.
+        Tell everyone we're a changed man. """
+        self.focus = focus
+        self._modified()
+
+
+    def get_next(self, index):
+        """ Return the next line. """
+        return self._getline(index + 1)
+
+
+    def get_prev(self, index):
+        """ Return the previous line. """
+        return self._getline(index - 1)
+
+
+    def inrange(self, index):
+        if index < TAGLEN or index > len(self.lyrics):
+            return False
+        return True
+
+
+    def isstamp(self):
+        """ Test whether current line is a timestamp or metadata. """
+        stamp = self.lyrics[self.focus].original_widget.caption
+        return stamp[0] == '['
+
+
+    def gettags(self):
+        metadata = {}
+        for line in self.lyrics[0:TAGLEN]:
+            field = line.original_widget.tag
+            value = line.original_widget.get_edit_text()
+            metadata[field] = value
+        return metadata
+
+
+    def gettag(self, tag):
+        try:
+            index = TAGS.index(tag)
+            return self.lyrics[index]
+        except ValueError:
+            return None
+
+
+    def settag(self, tag, text):
+        """ Set a metadata tag. """
+        try:
+            index = TAGS.index(tag)
+            self.lyrics[index] = text
+            self._modified()
+            return True
+        except ValueError:
+            return False
+
+
+    def insert(self, offset=0, time=False, copylast=False):
+        """ Insert (or copy, if copylast is True) a line at offset.
+        If time is set, synchronize timestamp of new line, too. """
+        index = self.focus + offset
+        if not (self.isstamp() and self.inrange(index)):
+            setstatus("Can't insert line on tag field")
+            return
+        if not time:
+            time = self._getelapsed()
+        if copylast:
+            text = self.lyrics[self.focus].original_widget.get_edit_text()
+        else:
+            text = ''
+        try:
+            self.lyrics.insert(index, self._newline(time, text))
+            self._modified()
+            setstatus('Inserted new line %d' % (1 + index))
+        except IndexError:
+            setstatus("Can't insert line %d" % (1 + index))
+
+
+    def swap(self, offset=-1):
+        """ Transpose line at offset. """
+        index = self.focus + offset
+        if not (self.isstamp() and self.inrange(index)):
+            setstatus("Can't swap line with tag field")
+            return
+        try:
+            self.lyrics[self.focus], self.lyrics[index] = \
+                    self.lyrics[index], self.lyrics[self.focus]
+            self._modified()
+            setstatus('Swapped line %d with line %d' % (1 + self.focus,
+                                                        1 + index))
+        except IndexError:
+            return
+
+
+    def yank(self):
+        """ Copy current line to cutbuffer. """
+        if not self.isstamp():
+            setstatus("Can't yank a tag field")
+            return
+        if self.cutbuffer[-1] is not self.lyrics[self.focus]:
+            if len(self.cutbuffer) > 100:
+                self.cutbuffer.pop(0)
+            self.cutbuffer.append(self.lyrics[self.focus])
+            setstatus('Line %d yanked' % (1 + self.focus))
+
+
+    def paste(self, offset=0):
+        """ Paste last line in cutbuffer to offset. """
+        index = self.focus + offset
+        if not (self.isstamp() and self.inrange(index)):
+            setstatus("Can't paste on tag field")
+            return
+        if len(self.cutbuffer) > 1:
+            self.lyrics.insert(index, self.cutbuffer.pop())
+            self._modified()
+            setstatus('Pasted on line %d' % (1 + index))
+        else:
+            setstatus('Cut buffer empty')
+
+
+    def cut(self):
+        """ Cut current line to cutbuffer. """
+        if not self.isstamp():
+            setstatus("Can't cut a tag field.")
+            return
+        if len(self.lyrics) < TAGLEN + 2:
+            self.yank()
+            self.replace('')
+            return
+        if len(self.cutbuffer) > 100:
+            self.cutbuffer.pop(0)
+        self.cutbuffer.append(self.lyrics.pop(self.focus))
+        setstatus('Cut line %d' % (self.focus + 1))
+        if self.focus >= len(self.lyrics):
+            self.focus -= 1
+        self._modified()
+
+
+    def sort(self):
+        """ Sort lyrics by timestamp. """
+        metadata = self.lyrics[:TAGLEN]
+        self.lyrics = self.lyrics[TAGLEN:]
+        self.lyrics.sort(key=lambda i:
+                         lrcutils.stamptosecs(i.original_widget.caption))
+        self.lyrics = metadata + self.lyrics
+        self._modified()
+        setstatus('Sorted by timestamp')
+
+
+    def replace(self, text):
+        """ Replace current line with text. """
+        self.lyrics[self.focus].original_widget.set_edit_text(text)
+        self._modified()
+
+
+    def synctime(self):
+        """ Synchronize timestamp to MPD. """
+        if not self.isstamp():
+            return
+        try:
+            elapsed = self._getelapsed()
+            self.lyrics[self.focus].original_widget.set_caption(
+                lrcutils.secstostamp(elapsed))
+            self._modified()
+            setstatus('Timestamp synchronized')
+        except IndexError:
+            return
+
+
+    def syncinfo(self):
+        """ Synchronize metadata to MPD. """
+        mpdmisc.mpdreconnect(self.client, self.mpdhost, self.mpdpass)
+        songinfo = self.client.currentsong()
+        fields = ('artist', 'title', 'album', 'copyright', 'time')
+        for i, f in enumerate(fields):
+            if f != 'time':
+                f = songinfo.get(f, '')
+            else:
+                f = songinfo.get(f, '0')
+            self.lyrics[i].original_widget.set_edit_text(f)
+        self._modified()
+        setstatus('Updated song info from MPD')
+
+
+    def revert(self):
+        self.__init__(self.infile, self.mpdhost, self.mpdpass)
+        setstatus('Reverted all changes', 'alert')
+
+
+
+class LRCEditor(object):
+    """ The coordinator. """
+    # Color scheme.
+    palette = [
+        ('title', 'white', 'dark blue', 'standout'),
+        ('status', 'white', 'dark blue', 'standout'),
+        ('current', 'black', 'dark cyan', 'standout'),
+        ('alert', 'white', 'dark red', 'bold')
+    ]
+    # Leave these in instance so we can change them from the outside.
+    title = urwid.Text('MPD Subtitle LRC Editor ' + VERSION, align='center')
+    titlebar = urwid.AttrMap(title, 'title')
+    status = urwid.Text('')
+    statusbar = urwid.AttrMap(status, 'status')
+
+    def __init__(self, infile, mpdhost, mpdpass, inplace, pack):
+        self.infile = infile
+        self.mpdhost = mpdhost
+        self.mpdpass = mpdpass
+        self.write_inplace = inplace
+        self.pack_tstamps = pack
+        # Stack LEGOs, build UI.
+        self.editor = LRCWalker(infile, mpdhost, mpdpass)
+        self.window = EditWindow(self.editor)
+        self.root = urwid.Frame(self.window, self.titlebar, self.statusbar)
+
+
+    def main(self):
+        """ Start main loop. """
+        self.loop = urwid.MainLoop(self.root, self.palette,
+                                   unhandled_input=self.keyhandler)
+        self.loop.run()
+
+
+    def keyhandler(self, key):
+        if type(key) == tuple:
+            # Scrollwheel sends Up and Down.
+            if key[0] == 'mouse press':
+                if key[1] == 4:
+                    self.loop.process_input(['up'])
+                elif key[1] == 5:
+                    self.loop.process_input(['down'])
+            else:
+                return
+        # Insert-mode scrolling.
+        elif key == 'insert up':
+            self.loop.process_input(['up'])
+            self.loop.process_input(['i'])
+        elif key == 'insert down':
+            self.loop.process_input(['down'])
+            self.loop.process_input(['i'])
+        # Quit without saving.
+        elif key == 'Q':
+            raise urwid.ExitMainLoop()
+        # Synchronize line and move down.
+        elif key == 'enter':
+            self.editor.synctime()
+            self.loop.process_input(['down'])
+        # Synchronize line.
+        elif key == 's':
+            self.editor.synctime()
+        # Insert line after.
+        elif key == 'o':
+            self.editor.insert(1)
+            self.loop.process_input(['down'])
+            self.loop.process_input(['i'])
+        # Insert line before.
+        elif key == 'O':
+            self.editor.insert()
+            self.loop.process_input(['i'])
+        # Paste line before.
+        elif key == 'p':
+            self.editor.paste()
+        # Paste line after.
+        elif key == 'P':
+            self.editor.paste(1)
+            self.loop.process_input(['down'])
+        # Duplicate line up.
+        elif key == 'k':
+            self.editor.insert(copylast=True)
+        # Duplicate line down.
+        elif key == 'K':
+            self.editor.insert(1, copylast=True)
+            self.loop.process_input(['down'])
+        # Transpose line up.
+        elif key == 't':
+            self.editor.swap()
+            self.loop.process_input(['up'])
+        # Transpose line down.
+        elif key == 'T':
+            self.editor.swap(1)
+            self.loop.process_input(['down'])
+        # Yank line.
+        elif key == 'y':
+            self.editor.yank()
+        # Cut line.
+        elif key == 'D':
+            self.editor.cut()
+        # Clear line.
+        elif key == 'X':
+            self.editor.replace('')
+        # Synchronize metadata.
+        elif key == 'R':
+            self.editor.sort()
+        elif key == 'S':
+            self.editor.syncinfo()
+        # Revert all changes.
+        elif key == 'U':
+            self.editor.revert()
+        # Toggle in-place write.
+        elif key == 'meta w':
+            self.write_inplace = not self.write_inplace
+            if self.write_inplace:
+                setstatus('Output will be written to input file.')
+            else:
+                setstatus('Output will be written to mpd-subtitles cache.')
+        # Write file.
+        elif key == 'W':
+            self.save()
+            pass
+        else:
+            setstatus('')
+            return
+        return True
+
+
+    def save(self):
+        lyrics = []
+        # Save to MPD subtitle cache if we're not writing in-place.
+        if not self.write_inplace:
+            home = os.path.expanduser('~')
+            path = os.path.join(home, '.cache', 'mpd-subtitles')
+        else:
+            path = self.infile
+        # Grab metadata from line walker.
+        info = self.editor.gettags()
+        info['re'] = 'mpd-subtitles'
+
+        # Build paths if we're not writing in-place.
+        if not self.write_inplace:
+            path = os.path.join(path, iomisc.sanitize(info['ar']).lower())
+            if not os.path.exists(path):
+                os.makedirs(path)
+            filename = iomisc.sanitize(info['ti']+'-'+info['du']+'.lrc')
+            path = os.path.join(path, filename.lower())
+
+        # Grab lyrics from line walker.
+        for line in self.editor.lyrics[TAGLEN:]:
+            time = line.original_widget.caption
+            text = line.original_widget.get_edit_text()
+            lyrics.append((time, text))
+
+        # Write metadata then lyrics to file.
+        with open(path, 'wb') as f:
+            for field, text in info.iteritems():
+                line = "[%s:%s]\n" % (field, text)
+                try:
+                    f.write(line.encode('utf-8'))
+                except UnicodeDecodeError:
+                    f.write(line)
+            for line in lrcutils.makelrc(lyrics, self.pack_tstamps):
+                try:
+                    f.write(line.encode('utf-8'))
+                except UnicodeDecodeError:
+                    f.write(line)
+        setstatus('Saved to "%s"' % path, 'alert')
+
+
+
+def setstatus(text, attr='status'):
+    """ Set status line. """
+    LRCEditor.status.set_text(text)
+    LRCEditor.statusbar.set_attr_map({None: attr})
+
+
+
+def main():
+    """ The lobby. """
+    # MPD server host and port.
+    mpdhost = ['localhost', 6600]
+    # MPD password.
+    mpdpass = None
+    # Don't write in-place by default.
+    opt_inplace = False
+    # Pack timestamps by default.
+    opt_pack = True
+
+    # Deal with any flags that were passed at run-time.
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'hip',
+                                   ['help', 'host=', 'port=', 'pass=',
+                                    'inplace', 'nopack'])
+    except getopt.GetoptError, error:
+        print(str(error))
+        sys.exit(1)
+    for o, a in opts:
+        if o in ('-h', '--help'):
+            usage()
+        if o in ('-i', '--inplace'):
+            opt_inplace = True
+        if o in ('-p', '--nopack'):
+            opt_pack = False
+        if o == '--host':
+            mpdhost[0] = a
+        if o == '--port':
+            mpdhost[1] = int(a)
+        if o == '--pass':
+            mpdpass = a
+
+    if len(args) == 0:
+        usage()
+
+    LRCEditor(args[0], mpdhost, mpdpass, opt_inplace, opt_pack).main()
+
+
+
+if __name__ == '__main__':
+    main()
